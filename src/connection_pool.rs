@@ -41,6 +41,7 @@ pub struct ConnectionPool {
     http_client: HttpClient,
     dns_resolver: Arc<Mutex<DnsResolver>>,
     connection_timeout: Duration,
+    max_connections: usize,
 }
 
 impl ConnectionPool {
@@ -73,38 +74,45 @@ impl ConnectionPool {
         // Acquire semaphore to ensure we don't exceed max connections
         let permit = self.semaphore.acquire().await.unwrap();
         
-        let mut inner = self.inner.lock().await;
-        
         // Try to find an idle connection
-        if let Some(entries) = inner.connections.get_mut(&key) {
-            if let Some(index) = entries.iter_mut().position(|entry| !entry.in_use && entry.last_used.elapsed() < inner.idle_timeout) {
-                let entry = &mut entries[index];
-                entry.in_use = true;
-                entry.last_used = Instant::now();
-                
-                // Get a mutable reference to the stream
-                let stream_ref = &mut entry.stream;
-                
-                drop(inner);
-                
-                // Return the connection guard
-                return Ok(ConnectionGuard {
-                    pool: self,
-                    key: key.clone(),
-                    stream_ref,
-                    permit: Some(permit),
-                });
+        let mut found_idle = false;
+        let mut stream_ref: Option<&mut HttpStream> = None;
+        let mut key_clone = key.clone();
+        
+        { 
+            let mut inner = self.inner.lock().await;
+            let idle_timeout = inner.idle_timeout;
+            
+            if let Some(entries) = inner.connections.get_mut(&key) {
+                // Find an idle entry
+                for entry in entries.iter_mut() {
+                    if !entry.in_use && entry.last_used.elapsed() < idle_timeout {
+                        entry.in_use = true;
+                        entry.last_used = Instant::now();
+                        stream_ref = Some(&mut entry.stream);
+                        found_idle = true;
+                        break;
+                    }
+                }
             }
+        }
+        
+        if found_idle {
+            return Ok(ConnectionGuard {
+                pool: self,
+                key: key_clone,
+                stream_ref: stream_ref.unwrap(),
+                permit: Some(permit),
+            });
         }
         
         // No idle connection, create a new one
         let host_clone = host.to_string();
+        let host_clone_for_tls = host_clone.clone();
         let scheme_clone = scheme.to_string();
         let dns_resolver = self.dns_resolver.clone();
         let http_client = self.http_client.clone();
         let connection_timeout = self.connection_timeout;
-        
-        drop(inner);
         
         // Resolve DNS in a blocking context
         let ip = tokio::task::spawn_blocking(move || {
@@ -116,28 +124,31 @@ impl ConnectionPool {
         let stream = timeout(connection_timeout, async move {
             match scheme_clone.as_str() {
                 "http" => http_client.connect_http((ip, port)),
-                "https" => http_client.connect_https((ip, port), &host_clone),
+                "https" => http_client.connect_https((ip, port), &host_clone_for_tls),
                 _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Unsupported scheme: {}", scheme_clone))),
             }
         }).await??;
         
         // Add the new connection to the pool
+        { 
+            let mut inner = self.inner.lock().await;
+            inner.total_connections += 1;
+            
+            let entry = ConnectionPoolEntry {
+                stream,
+                created_at: Instant::now(),
+                last_used: Instant::now(),
+                in_use: true,
+            };
+            
+            let entries = inner.connections.entry(key.clone()).or_insert_with(Vec::new);
+            entries.push(entry);
+        }
+        
+        // Get the new connection from the pool
         let mut inner = self.inner.lock().await;
-        inner.total_connections += 1;
-        
-        // Get a mutable reference to the new connection
-        let entry = ConnectionPoolEntry {
-            stream,
-            created_at: Instant::now(),
-            last_used: Instant::now(),
-            in_use: true,
-        };
-        
-        let entries = inner.connections.entry(key.clone()).or_insert_with(Vec::new);
-        entries.push(entry);
+        let entries = inner.connections.get_mut(&key).unwrap();
         let stream_ref = &mut entries.last_mut().unwrap().stream;
-        
-        drop(inner);
         
         Ok(ConnectionGuard {
             pool: self,
@@ -151,22 +162,28 @@ impl ConnectionPool {
         let mut inner = self.inner.lock().await; 
         let now = Instant::now(); 
         let mut keys_to_remove = Vec::new(); 
+        let idle_timeout = inner.idle_timeout; 
+        let mut total_removed = 0; 
         
+        // First pass: count removed connections and mark empty lists 
         for (key, entries) in &mut inner.connections { 
+            let original_len = entries.len(); 
+            
             // Remove idle connections that exceed the timeout 
-            entries.retain(|entry| entry.in_use || (now - entry.last_used) < inner.idle_timeout); 
+            entries.retain(|entry| entry.in_use || (now - entry.last_used) < idle_timeout); 
             
             // Count the number of connections removed 
-            let removed = entries.len() as i32 - entries.len() as i32; 
-            if removed > 0 { 
-                inner.total_connections = inner.total_connections.saturating_sub(removed as usize); 
-            } 
+            let removed = original_len - entries.len(); 
+            total_removed += removed; 
             
             // If no connections left, mark for removal 
             if entries.is_empty() { 
                 keys_to_remove.push(key.clone()); 
             } 
         } 
+        
+        // Update total connections 
+        inner.total_connections = inner.total_connections.saturating_sub(total_removed); 
         
         // Remove empty connection lists 
         for key in keys_to_remove { 
@@ -224,10 +241,10 @@ pub struct PoolStats {
 } 
 
 pub struct ConnectionGuard<'a> {
-    pool: &'a ConnectionPool,
-    key: ConnectionKey,
-    stream_ref: &'a mut HttpStream,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub pool: &'a ConnectionPool,
+    pub key: ConnectionKey,
+    pub stream_ref: &'a mut HttpStream,
+    pub permit: Option<tokio::sync::SemaphorePermit<'a>>,
 }
 
 impl<'a> ConnectionGuard<'a> {
